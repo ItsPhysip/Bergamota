@@ -1,12 +1,13 @@
 Scan-out: a GPU copy that is still in flight is no longer overwritten by the next frame's copy. Up to two copies are in
 flight, into the two buffers that are neither on the panel nor queued for it, and each is shown when it lands. Before,
 the next frame's copy went into the in-flight copy's buffer and restarted the wait, so while the GPU stayed busy (the
-lock-screen unlock: 74 swaps, 14 on the panel in 2 s) almost no frame reached the panel. coalesced now counts a copy
-replaced before its vsync when that happens, not when the next copy is queued.
+lock-screen unlock: 74 swaps, 14 on the panel in 2 s) almost no frame reached the panel. A swap queued behind a copy in
+flight completes when that copy lands, so CoreAnimation cannot queue frames faster than the GPU finishes them.
+coalesced now counts a copy replaced before its vsync when that happens, not when the next copy is queued.
 
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -335,10 +335,13 @@
+@@ -335,10 +335,15 @@
  	uint32_t      fScanGpuFails, fScanGpuRest;
  	/* 0241: the blit in flight. The swap is complete as soon as it is queued (anything CoreAnimation submits later runs
  	 * after it on the GPU ring, so its surface is read before it can be drawn again); scanBlitPoll scans buffer
@@ -17,23 +18,26 @@ replaced before its vsync when that happens, not when the next copy is queued.
 +	 * fScanBlitT once the fence has passed. -1: none.
 +	 * 0252: two in flight, [0] the oldest. A frame that arrives while a copy is in flight is copied into the third buffer
 +	 * when one is free, so the earlier copy is still shown when it lands; it reused that copy's buffer before, and while the
-+	 * GPU stayed busy (the lock-screen unlock) each copy was replaced before it landed and the panel kept its old frame. */
++	 * GPU stayed busy (the lock-screen unlock) each copy was replaced before it landed and the panel kept its old frame.
++	 * fScanBlitSwap: a swap queued behind a copy in flight completes only when that copy lands (0 = completed), so
++	 * CoreAnimation cannot queue frames faster than the GPU finishes them. */
 +	int           fScanBlitT[2];
-+	uint32_t      fScanBlitFence[2], fScanBlitId[2];
++	uint32_t      fScanBlitFence[2], fScanBlitId[2], fScanBlitSwap[2];
 +	uint64_t      fScanBlitAbs[2];
  	void          scanBlitPoll(void);
  	bool          scanGpuActive(void) const { return fScanCopy && !fScanFailed && fScanGpu && !fScanGpuOff && fScanGpuRest == 0; }
  	IOMemoryMap  *fScanMap[3];
-@@ -746,7 +749,7 @@
+@@ -746,7 +751,8 @@
  				PE_parse_boot_argn("sweetfb_scancopy", &sc, sizeof(sc));
  				fScanCopy = fEarly && sc != 0;
  				fScanGpu = fScanCopy && sc == 2;
 -				fScanBlitT = -1;
 +				fScanBlitT[0] = fScanBlitT[1] = -1;
++				fScanBlitSwap[0] = fScanBlitSwap[1] = 0;
  				fScanPanel = fScanQueued = -1;
  				if (fScanCopy) {
  					IOLog("SWEET FB: scan-out copy on (0235): frames are copied to three framebuffer-owned buffers, a swap is complete when copied\n");
-@@ -2276,39 +2279,48 @@
+@@ -2276,39 +2282,58 @@
  void
  AppleCLCD::scanBlitPoll(void)
  {
@@ -90,7 +94,9 @@ replaced before its vsync when that happens, not when the next copy is queued.
 +		fScanBlitFence[0] = fScanBlitFence[1];
 +		fScanBlitId[0] = fScanBlitId[1];
 +		fScanBlitAbs[0] = fScanBlitAbs[1];
++		fScanBlitSwap[0] = fScanBlitSwap[1];
 +		fScanBlitT[1] = -1;
++		fScanBlitSwap[1] = 0;
 +		if (fScanQueued >= 0) {
 +			if (latchedNow()) {
 +				fScanPanel = fScanQueued;
@@ -104,6 +110,14 @@ replaced before its vsync when that happens, not when the next copy is queued.
 +		fScanQueued = t;
 +		fScanFront = true;
 +		__atomic_store_n(&fShotId, id, __ATOMIC_RELEASE);
++		uint32_t sw = fScanBlitT[0] >= 0 ? fScanBlitSwap[0] : 0;
++		fScanBlitSwap[0] = 0;
++		if (sw != 0 && (int32_t)(sw - __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE)) > 0) {
++			__atomic_store_n(&fSwapDone, sw, __ATOMIC_RELEASE);     /* 0252: the copy before it landed */
++			if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(sw)) {
++				tr->done = mach_absolute_time();
++			}
++		}
  	}
 -	scanAddr((uint32_t)fScanPA[t], fScanStride, true);
 -	fScanForeign = false;
@@ -113,7 +127,7 @@ replaced before its vsync when that happens, not when the next copy is queued.
  }
  
  bool
-@@ -2347,16 +2359,16 @@
+@@ -2347,16 +2372,16 @@
  		fScanQueued = -1;
  	}
  	int t = 0;
@@ -136,7 +150,7 @@ replaced before its vsync when that happens, not when the next copy is queued.
  	uint64_t t0 = mach_absolute_time();
  	const uint8_t *src = (const uint8_t *)(kva + s->offset);
  	uint64_t span = (uint64_t)s->bytesPerRow * (fLogicalH - 1) + rowBytes;
-@@ -2391,10 +2403,10 @@
+@@ -2391,11 +2416,12 @@
  				 */
  				fScanGpuFails = 0;
  				fSt.scanGpuCopies++;
@@ -144,14 +158,17 @@ replaced before its vsync when that happens, not when the next copy is queued.
 -				fScanBlitFence = fence;
 -				fScanBlitId = id;
 -				fScanBlitAbs = t0;
+-				if ((int32_t)(fCurSwapID - __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE)) > 0) {
 +				fScanBlitT[slot] = t;
 +				fScanBlitFence[slot] = fence;
 +				fScanBlitId[slot] = id;
 +				fScanBlitAbs[slot] = t0;
- 				if ((int32_t)(fCurSwapID - __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE)) > 0) {
++				fScanBlitSwap[slot] = slot == 1 ? fCurSwapID : 0;
++				if (slot == 0 && (int32_t)(fCurSwapID - __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE)) > 0) {
  					__atomic_store_n(&fSwapDone, fCurSwapID, __ATOMIC_RELEASE);
  					if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(fCurSwapID)) {
-@@ -2432,10 +2444,11 @@
+ 						tr->done = mach_absolute_time();
+@@ -2432,10 +2458,12 @@
  				IODelay(50);
  			}
  			/* a GPU copy still in flight into this buffer would land on top of the CPU's: let it finish, and drop its scan */
@@ -162,10 +179,11 @@ replaced before its vsync when that happens, not when the next copy is queued.
  			}
 -			fScanBlitT = -1;
 +			fScanBlitT[0] = fScanBlitT[1] = -1;
++			fScanBlitSwap[0] = fScanBlitSwap[1] = 0;
  		}
  		if (sweet_lowpool_cacheable()) {
  			/* the GPU wrote DRAM behind this write-back mapping; a CPU draw may sit dirty in it (civac keeps that) */
-@@ -2450,6 +2463,9 @@
+@@ -2450,6 +2478,9 @@
  			}
  		}
  	}
